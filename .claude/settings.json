@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -c src/thingsboardReportService.js)",
+      "Bash(curl -s -m 8 http://localhost:6006/health)",
+      "Bash(curl -s -m 10 \"http://localhost:6006/api/v1/sequence-report/SURIN-BFW_XTRON_2,SURIN-BFW_XTRON_1,Test%20device%20-%2001/all/2026-06-18/2026-06-18/1/10\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('totalReports:', d.get\\('totalReports'\\), '| rows:', len\\(d.get\\('data',[]\\)\\)\\); [print\\(' -', r.get\\('machine_name'\\), 'part', r.get\\('part_number'\\)\\) for r in d.get\\('data',[]\\)[:8]]\")",
+      "Bash(curl -s -m 12 \"http://localhost:6006/api/v1/sequence-report/SURIN-BFW_XTRON_2,SURIN-BFW_XTRON_1,Test%20device%20-%2001/all/2026-06-18/2026-06-18/1/10\")",
+      "PowerShell($p = Get-Process node -ErrorAction SilentlyContinue; if \\($p\\) { Write-Host \"node running, PID\\(s\\): $\\($p.Id -join ', '\\)\" } else { Write-Host \"NO node process running\" }; netstat -ano | Select-String \":6006\" | Select-String \"LISTENING\")",
+      "Bash(node index.js)",
+      "Bash(echo \"started, pid $!\")",
+      "Bash(kill %1)",
+      "Bash(curl -s -m 6 -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://localhost:6006/health)",
+      "Bash(curl -s -m 6 -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://192.168.0.62:6006/health)",
+      "Bash(node -c src/routes/reports.js)",
+      "Bash(curl -s -m 6 http://localhost:6006/health)",
+      "Bash(curl -s -m 10 -o /dev/null -w \"HTTP %{http_code}\\\\n\" \"http://localhost:6006/api/v1/sequence-report/download/Test%20device%20-%2001/1/2026-06-19/2026-06-19\")",
+      "Bash(curl -s -m 10 \"http://localhost:6006/api/v1/sequence-report/download/Test%20device%20-%2001/1/2026-06-19/2026-06-19\")",
+      "PowerShell($procs = Get-Process node -ErrorAction SilentlyContinue; if \\($procs\\) { Write-Host \"node processes running: $\\($procs.Count\\)\"; $procs | Select-Object Id, StartTime | Format-Table -AutoSize } else { Write-Host \"no node processes\" })",
+      "Bash(echo \"started pid $!\")",
+      "Bash(curl -s -m 12 \"http://localhost:6006/api/v1/sequence-report/download/Test%20device%20-%2001/1/2026-06-19/2026-06-19\")",
+      "Bash(curl -s -m 12 -o /dev/null -w \"HTTP %{http_code}, %{size_download} bytes\\\\n\" \"http://localhost:6006/api/v1/sequence-report/download/SURIN-BFW_XTRON_2,SURIN-BFW_XTRON_1,Test%20device%20-%2001/1/2026-06-19/2026-06-19\")",
+      "PowerShell($listen = Get-NetTCPConnection -LocalPort 6006 -State Listen -ErrorAction SilentlyContinue; if \\($listen\\) { $listen | ForEach-Object { $p = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue; Write-Host \"Port 6006 LISTENING: PID $\\($_.OwningProcess\\) \\($\\($p.ProcessName\\)\\), started $\\($p.StartTime\\)\" } } else { Write-Host \"Nothing LISTENING on 6006\" })",
+      "Bash(curl -s -m 10 -o /dev/null -w \"download route: HTTP %{http_code}\\\\n\" \"http://localhost:6006/api/v1/sequence-report/download/Test%20device%20-%2001/1/2026-06-19/2026-06-19\")",
+      "Bash(curl -s -m 12 -D - \"http://localhost:6006/api/v1/sequence-report/download/SURIN-BFW_XTRON_2,SURIN-BFW_XTRON_1,Test%20device%20-%2001/1/2026-06-19/2026-06-19\" -o /c/tmp/test.csv)",
+      "PowerShell(Get-NetTCPConnection -LocalPort 6006 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }; Start-Sleep -Seconds 2; Write-Host \"port freed\")",
+      "Bash(curl -s -m 12 -o /dev/null -w \"HTTP %{http_code}, %{size_download} bytes\\\\n\" \"http://localhost:6006/api/v1/sequence-report/download/SURIN-BFW_XTRON_2%2CSURIN-BFW_XTRON_1%2CTest%20device%20-%2001//2026-06-19/2026-06-19\")",
+      "Bash(curl -s -m 4 -o /dev/null -w \"localhost:6006 -> HTTP %{http_code}\\\\n\" http://localhost:6006/health)",
+      "PowerShell(Get-NetTCPConnection -LocalPort 6006 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }; Start-Sleep -Seconds 2; $l = Get-NetTCPConnection -LocalPort 6006 -State Listen -ErrorAction SilentlyContinue; if \\($l\\) { Write-Host \"still running\" } else { Write-Host \"PORT 6006 FREE\" })"
+    ]
+  }
+}

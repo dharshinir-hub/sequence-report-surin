@@ -49,18 +49,30 @@ class ScheduledReportUpdater {
     const unique = [];
     inRange.forEach(e => {
       let v = e.value;
-      // If the value is a JSON object/string, prefer a human-readable field
-      // (live_alarm carries alarm_message)
+      let skip = false;
+
+      // For JSON objects: only extract alarm_message. If it doesn't exist, skip.
       if (typeof v === 'object' && v !== null) {
-        v = v.alarm_message || v.name || v.alarm || v.message || JSON.stringify(v);
+        if (v.alarm_message) {
+          v = v.alarm_message;
+        } else {
+          skip = true; // Skip JSON objects without alarm_message
+        }
       } else if (typeof v === 'string' && v.trim().startsWith('{')) {
         try {
           const obj = JSON.parse(v);
-          v = obj.alarm_message || obj.name || obj.alarm || obj.message || v;
+          if (obj.alarm_message) {
+            v = obj.alarm_message;
+          } else {
+            skip = true; // Skip JSON strings without alarm_message
+          }
         } catch (e) { /* keep raw string */ }
       }
-      v = String(v);
-      if (v !== '' && !unique.includes(v)) unique.push(v);
+
+      if (!skip) {
+        v = String(v);
+        if (v !== '' && !unique.includes(v)) unique.push(v);
+      }
     });
 
     return unique.length > 0 ? unique.join('||') : '-';
@@ -104,7 +116,28 @@ class ScheduledReportUpdater {
     // Sort by start_time ascending (earliest first, current/latest last)
     components.sort((a, b) => a.start_time - b.start_time);
 
-    return components;
+    // Deduplicate the SAME component (same code) that was posted more than once
+    // for this part. Merge their time windows so it appears just once. Different
+    // components (different codes) are kept separate.
+    const deduped = [];
+    const byCode = new Map();
+    components.forEach(comp => {
+      if (byCode.has(comp.code)) {
+        const existing = byCode.get(comp.code);
+        existing.start_time = Math.min(existing.start_time, comp.start_time);
+        existing.end_time = Math.max(existing.end_time, comp.end_time);
+        // keep the richer sequence list if the existing one is empty
+        if ((!existing.sequences || existing.sequences.length === 0) && comp.sequences) {
+          existing.sequences = comp.sequences;
+        }
+      } else {
+        const copy = { ...comp };
+        byCode.set(comp.code, copy);
+        deduped.push(copy);
+      }
+    });
+
+    return deduped;
   }
 
   // Parse shift schedule - handles both string format and array of shift objects
@@ -190,10 +223,19 @@ class ScheduledReportUpdater {
     // Sort by start_time ascending so the current (latest) operator is last (2nd place)
     operators.sort((a, b) => a.start_time - b.start_time);
 
+    // Deduplicate the SAME operator (same code) posted more than once for this
+    // part, so it isn't shown as "2||2". Different operators are kept separate.
+    const seen = new Set();
+    const uniqueOperators = operators.filter(o => {
+      if (seen.has(o.code)) return false;
+      seen.add(o.code);
+      return true;
+    });
+
     // Merge multiple operators with || (current/latest one appears last)
     return {
-      code: operators.map(o => o.code).join('||'),
-      name: operators.map(o => o.name).join('||')
+      code: uniqueOperators.map(o => o.code).join('||'),
+      name: uniqueOperators.map(o => o.name).join('||')
     };
   }
 
@@ -935,56 +977,59 @@ class ScheduledReportUpdater {
   // Get part report from cache - returns complete sequence report format
   getPartReportByMachine(machine, shiftNo, fromTime, toTime, page = 0, limit = 10) {
     try {
-      let deviceId = Object.keys(this.cachedReports).find(
-        id => this.cachedReports[id].device_name === machine
-      );
-
-      if (!deviceId) {
-        deviceId = Object.keys(this.cachedReports).find(
-          id => this.cachedReports[id].device_name.toLowerCase() === machine.toLowerCase()
-        );
-      }
-
-      if (!deviceId) {
-        console.log(`[Cache] Device not found: ${machine}. Available devices:`, Object.values(this.cachedReports).map(d => d.device_name));
-        return { message: 'Gopal', data: [], Page: page + 1, pagecount: limit, totalReports: 0 };
-      }
-
-      const cached = this.cachedReports[deviceId];
       const fromTimestamp = parseInt(fromTime);
       const toTimestamp = parseInt(toTime);
 
-      console.log(`[Cache] ${machine}: ${cached.reports.length} total reports. Filtering by timestamp range ${fromTimestamp} - ${toTimestamp}`);
-      console.log(`[Cache] Sample timestamps in cache:`, cached.reports.slice(0, 3).map(r => ({ ts: r.ts, date: new Date(r.ts).toISOString() })));
+      // "All Machines" sends multiple device names comma-separated -> support a list
+      const machineNames = String(machine)
+        .split(',')
+        .map(m => m.trim())
+        .filter(m => m.length > 0);
 
       let reportData = [];
 
-      cached.reports.forEach(r => {
-        if (r.ts >= fromTimestamp && r.ts <= toTimestamp) {
-          // Return complete report with sequence_detail as-is
-          reportData.push({
-            actual_part: r.data.actual_part || 0,
-            part_number: r.data.part_number,
-            start_time: r.data.start_time,
-            end_time: r.data.end_time,
-            machine_name: r.data.machine_name,
-            operator_no: r.data.operator_no,
-            operator_name: r.data.operator_name,
-            component_no: r.data.component_no,
-            component_name: r.data.component_name,
-            serial_number: r.data.serial_number || '-',
-            program_number: r.data.program_number || '-',
-            revision_no: r.data.revision_no || '-',
-            setup_number: r.data.setup_number || '-',
-            component_status: r.data.component_status || 'NEW',
-            part_message: r.data.part_message || '-',
-            run_time: Math.round((r.data.run_time || 0) / 1000),
-            idle_time: Math.round((r.data.idle_time || 0) / 1000),
-            disconnect_time: Math.round((r.data.disconnect_time || 0) / 1000),
-            alarm_time: Math.round((r.data.alarm_time || 0) / 1000),
-            sequence_detail: r.data.sequence_detail || []
-          });
+      machineNames.forEach(name => {
+        // Find this device by exact name, else case-insensitive
+        let deviceId = Object.keys(this.cachedReports).find(
+          id => this.cachedReports[id].device_name === name
+        );
+        if (!deviceId) {
+          deviceId = Object.keys(this.cachedReports).find(
+            id => this.cachedReports[id].device_name.toLowerCase() === name.toLowerCase()
+          );
         }
+        if (!deviceId) {
+          return; // unknown machine name -> skip
+        }
+
+        const cached = this.cachedReports[deviceId];
+        cached.reports.forEach(r => {
+          if (r.ts >= fromTimestamp && r.ts <= toTimestamp) {
+            // Return complete report with sequence_detail as-is
+            reportData.push({
+              actual_part: r.data.actual_part || 0,
+              part_number: r.data.part_number,
+              start_time: r.data.start_time,
+              end_time: r.data.end_time,
+              machine_name: r.data.machine_name,
+              operator_no: r.data.operator_no,
+              operator_name: r.data.operator_name,
+              component_no: r.data.component_no,
+              component_name: r.data.component_name,
+              serial_number: r.data.serial_number || '-',
+              program_number: r.data.program_number || '-',
+              revision_no: r.data.revision_no || '-',
+              setup_number: r.data.setup_number || '-',
+              component_status: r.data.component_status || 'NEW',
+              part_message: r.data.part_message || '-',
+              run_time: Math.round((r.data.run_time || 0) / 1000),
+              idle_time: Math.round((r.data.idle_time || 0) / 1000),
+              disconnect_time: Math.round((r.data.disconnect_time || 0) / 1000),
+              alarm_time: Math.round((r.data.alarm_time || 0) / 1000),
+              sequence_detail: r.data.sequence_detail || []
+            });
+          }
+        });
       });
 
       // Sort by timestamp descending (newest/current part first)
@@ -1001,11 +1046,14 @@ class ScheduledReportUpdater {
         data: paginatedData,
         Page: page + 1,
         pagecount: limit,
-        totalReports
+        totalReports,
+        // aliases the frontend pagination reads (total / totalCount)
+        total: totalReports,
+        totalCount: totalReports
       };
     } catch (error) {
       console.error('Error getting part report:', error.message);
-      return { message: 'Gopal', data: [], Page: page + 1, pagecount: limit, totalReports: 0 };
+      return { message: 'Gopal', data: [], Page: page + 1, pagecount: limit, totalReports: 0, total: 0, totalCount: 0 };
     }
   }
 

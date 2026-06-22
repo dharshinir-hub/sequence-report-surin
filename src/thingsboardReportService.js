@@ -6,10 +6,30 @@ class ThingsboardReportService {
     this.user = process.env.THINGSBOARD_USER;
     this.password = process.env.THINGSBOARD_PASSWORD;
     this.token = null;
+    this.tokenExpiry = 0; // epoch ms when the current token expires
   }
 
-  async authenticate() {
-    if (this.token) return this.token;
+  // Decode a JWT's "exp" claim (seconds) into epoch ms; falls back to +1h
+  getTokenExpiry(token) {
+    try {
+      const payload = JSON.parse(
+        Buffer.from(token.split('.')[1], 'base64').toString('utf8')
+      );
+      if (payload && payload.exp) return payload.exp * 1000;
+    } catch (e) {
+      // ignore decode errors, use fallback below
+    }
+    return Date.now() + 60 * 60 * 1000;
+  }
+
+  // Returns a valid token, re-logging in when expired/near expiry (or forced).
+  // This prevents the "works until the token expires, then needs a restart" bug.
+  async authenticate(force = false) {
+    const now = Date.now();
+    // Reuse the cached token only while it's still valid (60s safety buffer)
+    if (!force && this.token && now < this.tokenExpiry - 60000) {
+      return this.token;
+    }
 
     try {
       const response = await axios.post(`${this.baseUrl}/api/auth/login`, {
@@ -17,10 +37,22 @@ class ThingsboardReportService {
         password: this.password
       });
       this.token = response.data.token;
+      this.tokenExpiry = this.getTokenExpiry(this.token);
       return this.token;
     } catch (error) {
       console.error('Authentication failed:', error.message);
+      this.token = null;
+      this.tokenExpiry = 0;
       throw error;
+    }
+  }
+
+  // If a request failed with 401 Unauthorized, drop the cached token so the
+  // next call logs in again (handles ThingsBoard restarts / revoked tokens).
+  clearTokenOnAuthError(error) {
+    if (error && error.response && error.response.status === 401) {
+      this.token = null;
+      this.tokenExpiry = 0;
     }
   }
 
@@ -47,6 +79,7 @@ class ThingsboardReportService {
       return response.data.data || [];
     } catch (error) {
       console.error('Failed to fetch devices for customer:', error.message);
+      this.clearTokenOnAuthError(error);
       return [];
     }
   }
@@ -56,13 +89,16 @@ class ThingsboardReportService {
     try {
       await this.authenticate();
       const keyParam = keys.join(',');
+      // Fetch with a large limit to ensure all telemetry in the time range is returned
+      // (e.g., all serial_number, program_number, revision_no changes during the part window)
       const response = await axios.get(
-        `${this.baseUrl}/api/plugins/telemetry/DEVICE/${deviceId}/values/timeseries?keys=${keyParam}&startTs=${startTime}&endTs=${endTime}`,
+        `${this.baseUrl}/api/plugins/telemetry/DEVICE/${deviceId}/values/timeseries?keys=${keyParam}&startTs=${startTime}&endTs=${endTime}&limit=10000`,
         { headers: { 'X-Authorization': `Bearer ${this.token}` } }
       );
       return response.data;
     } catch (error) {
       console.error('Failed to fetch telemetry:', error.message);
+      this.clearTokenOnAuthError(error);
       return {};
     }
   }
@@ -79,6 +115,7 @@ class ThingsboardReportService {
       return response.data;
     } catch (error) {
       console.error('Failed to fetch latest telemetry:', error.message);
+      this.clearTokenOnAuthError(error);
       return {};
     }
   }
@@ -105,6 +142,7 @@ class ThingsboardReportService {
       return true;
     } catch (error) {
       console.error(`Error posting ${telemetryKey} to ThingsBoard:`, error.response?.status, error.message);
+      this.clearTokenOnAuthError(error);
       return false;
     }
   }
@@ -392,6 +430,7 @@ class ThingsboardReportService {
       return attributes;
     } catch (error) {
       console.error('Failed to fetch customer attributes:', error.message);
+      this.clearTokenOnAuthError(error);
       return {};
     }
   }
