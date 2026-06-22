@@ -16,6 +16,13 @@ if (fs.existsSync(envPath)) {
   });
 }
 
+// Quiet terminal: silence all the per-cycle / debug output. Keep one startup
+// line below, and leave console.error intact so real failures still surface.
+const _log = console.log.bind(console);
+console.log = () => {};
+console.info = () => {};
+console.warn = () => {};
+
 const app = express();
 app.use(bodyParser.json());
 
@@ -111,16 +118,7 @@ const CUSTOMER_NAME = process.env.CUSTOMER_NAME || 'surin';
 const CUSTOMER_ID = process.env.CUSTOMER_ID;
 
 const server = app.listen(PORT, () => {
-  console.log(`
-╔═══════════════════════════════════════════════════════════╗
-║           SEQUENCE REPORT API - SURIN                     ║
-╚═══════════════════════════════════════════════════════════╝
-
-📊 Server: http://localhost:${PORT}
-🔄 Updates: Every 2 minutes
-
-✅ Ready - Caching SURIN devices...
-  `);
+  _log('Sequence report running');
 });
 
 // Handle port-already-in-use gracefully instead of crashing
