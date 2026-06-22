@@ -247,7 +247,7 @@ class ScheduledReportUpdater {
   //   - a component whose window ends before/at the part end (or is followed by
   //     another component, or whose part is complete) is "closed": its running
   //     sequence is finalized and remaining sequences are marked Skipped
-  buildSequenceDetail(componentsInPart, deviceSeqData, partStartTime, partEndTime, isPartComplete = false, machineStatus = [], liveAlarm = []) {
+  buildSequenceDetail(componentsInPart, deviceSeqData, partStartTime, partEndTime, isPartComplete = false, machineStatus = [], liveAlarm = [], deviceBalloonData = []) {
     if (!componentsInPart || componentsInPart.length === 0) {
       return [];
     }
@@ -256,6 +256,20 @@ class ScheduledReportUpdater {
     let readings = [];
     if (deviceSeqData && deviceSeqData.length > 0) {
       readings = deviceSeqData
+        .map(entry => {
+          const ts = Array.isArray(entry) ? entry[0] : entry.ts;
+          const value = parseInt(Array.isArray(entry) ? entry[1] : entry.value);
+          return { ts, value };
+        })
+        .filter(r => !isNaN(r.value))
+        .sort((a, b) => a.ts - b.ts);
+    }
+
+    // Parse device balloon_seq readings the same way. These drive the nested
+    // balloon sub-records inside each sequence, scoped to that sequence's window.
+    let balloonReadings = [];
+    if (deviceBalloonData && deviceBalloonData.length > 0) {
+      balloonReadings = deviceBalloonData
         .map(entry => {
           const ts = Array.isArray(entry) ? entry[0] : entry.ts;
           const value = parseInt(Array.isArray(entry) ? entry[1] : entry.value);
@@ -289,7 +303,8 @@ class ScheduledReportUpdater {
         windowEnd,
         closeAtEnd,
         machineStatus,
-        liveAlarm
+        liveAlarm,
+        balloonReadings
       );
 
       detail = detail.concat(compDetail);
@@ -312,12 +327,15 @@ class ScheduledReportUpdater {
   // When the window is closed (closeAtEnd), the final record is finalized and any
   // remaining Pending sequences are marked Skipped. With no readings: active ->
   // single auto first record ("-" fields); closed -> all sequences Skipped.
-  buildComponentSequenceDetail(sequences, allReadings, windowStart, windowEnd, closeAtEnd, machineStatus = [], liveAlarm = []) {
+  buildComponentSequenceDetail(sequences, allReadings, windowStart, windowEnd, closeAtEnd, machineStatus = [], liveAlarm = [], allBalloonReadings = []) {
     if (!sequences || sequences.length === 0) {
       return [];
     }
 
     // Base records - all start as Pending
+    // _balloonList carries this sequence's planned balloon_seq list (from
+    // live_component) so the nested balloon detail can be built later. It is an
+    // internal field and is stripped before the record is returned.
     const records = sequences.map((seq, index) => ({
       operation_sequence: parseInt(seq.sequence) || (index + 1),
       start: '-',
@@ -331,7 +349,9 @@ class ScheduledReportUpdater {
       actual_alarm: 0,
       total_seq_time: 0,
       message: '-',
-      alarm: '-'
+      alarm: '-',
+      balloon_seq: [],
+      _balloonList: seq.balloon_seq || []
     }));
 
     // Device readings that fall inside this component's window
@@ -340,11 +360,17 @@ class ScheduledReportUpdater {
     // No readings in this window
     if (readings.length === 0) {
       if (closeAtEnd) {
-        // Component window finished without any sequence -> all Skipped
-        records.forEach(r => { r.operation_status = 'Skipped'; });
+        // Component window finished without any sequence -> all Skipped.
+        // Each sequence's balloons are Skipped too (first-from-list shown).
+        records.forEach(r => {
+          r.operation_status = 'Skipped';
+          r.balloon_seq = this.buildBalloonSeqDetail(r._balloonList || [], [], windowStart, windowEnd, true, machineStatus, liveAlarm);
+          delete r._balloonList;
+        });
         return records;
       }
-      // Active component, nothing run yet -> auto first record, all fields "-"
+      // Active component, nothing run yet -> auto first record, all fields "-".
+      // Post the first balloon from the list too, with "-" fields (same concept).
       const first = sequences[0];
       return [{
         operation_sequence: parseInt(first.sequence) || 1,
@@ -359,7 +385,8 @@ class ScheduledReportUpdater {
         actual_alarm: '-',
         total_seq_time: '-',
         message: '-',
-        alarm: '-'
+        alarm: '-',
+        balloon_seq: this.buildBalloonSeqDetail(first.balloon_seq || [], [], windowStart, windowEnd, false, machineStatus, liveAlarm)
       }];
     }
 
@@ -379,7 +406,9 @@ class ScheduledReportUpdater {
         actual_alarm: 0,
         total_seq_time: 0,
         message: '-',
-        alarm: '-'
+        alarm: '-',
+        balloon_seq: [],
+        _balloonList: (planned && planned.balloon_seq) || []
       };
     };
 
@@ -494,6 +523,10 @@ class ScheduledReportUpdater {
       if (records.length - 1 > maxReachedIndex) maxReachedIndex = records.length - 1;
     }
 
+    // The one record still left open (only when the window wasn't closed): its
+    // last balloon should stay Running too, so it must NOT be force-closed.
+    const openRecord = closeAtEnd ? null : running;
+
     // Output: forward sequences reached, plus appended re-run / unknown records
     let output = maxReachedIndex >= 0 ? records.slice(0, maxReachedIndex + 1) : [];
     output = output.concat(appended);
@@ -513,7 +546,8 @@ class ScheduledReportUpdater {
         actual_alarm: '-',
         total_seq_time: '-',
         message: '-',
-        alarm: '-'
+        alarm: '-',
+        balloon_seq: this.buildBalloonSeqDetail(first.balloon_seq || [], [], windowStart, windowEnd, closeAtEnd, machineStatus, liveAlarm)
       }];
     }
 
@@ -534,6 +568,266 @@ class ScheduledReportUpdater {
         // Any disconnect during the sequence marks it Incomplete (Network Off)
         if (rec.actual_disonnect > 0) {
           rec.operation_status = 'Incomplete';
+          rec.message = 'Network Off';
+        }
+
+        // Build the nested balloon detail for this sequence, scoped to the
+        // sequence's own [start, end] window. Same skipped/completed/incomplete
+        // tracking, driven by the device balloon_seq stream. The window is
+        // closed unless this is the still-running open sequence record.
+        rec.balloon_seq = this.buildBalloonSeqDetail(
+          rec._balloonList || [],
+          allBalloonReadings,
+          rec.start,
+          rec.end,
+          rec !== openRecord,
+          machineStatus,
+          liveAlarm
+        );
+      } else {
+        // Non-materialized sequence (e.g. Skipped, start "-") never ran, so its
+        // balloons are all Skipped too (first-from-list still shown).
+        rec.balloon_seq = this.buildBalloonSeqDetail(
+          rec._balloonList || [],
+          [],
+          windowStart,
+          windowEnd,
+          true,
+          machineStatus,
+          liveAlarm
+        );
+      }
+      // Strip the internal planned-balloon list before returning
+      delete rec._balloonList;
+    });
+
+    return output;
+  }
+
+  // Build the nested balloon_seq detail for ONE sequence window. This mirrors
+  // buildComponentSequenceDetail exactly (skipped / completed / incomplete /
+  // rework / unknown tracking) but one level deeper: the planned list is the
+  // sequence's own balloon_seq array and the readings come from the device
+  // balloon_seq telemetry stream, scoped to [windowStart, windowEnd].
+  buildBalloonSeqDetail(balloons, allBalloonReadings, windowStart, windowEnd, closeAtEnd, machineStatus = [], liveAlarm = []) {
+    if (!balloons || balloons.length === 0) {
+      return [];
+    }
+
+    // Base records - all start as Pending
+    const records = balloons.map((b, index) => ({
+      balloon_seq: parseInt(b.sequence) || (index + 1),
+      start: '-',
+      end: '-',
+      duration: 0,
+      balloon_status: 'Pending',
+      planned_touch_time: this.parseTouchTime(b.touch_time || '00:00:00'),
+      actual_run: 0,
+      actual_idle: 0,
+      actual_disconnect: 0,
+      actual_alarm: 0,
+      total_seq_time: 0,
+      message: '-',
+      alarm: '-'
+    }));
+
+    // Device balloon readings that fall inside this sequence's window
+    const readings = allBalloonReadings.filter(r => r.ts >= windowStart && r.ts <= windowEnd);
+
+    // No readings in this window
+    if (readings.length === 0) {
+      if (closeAtEnd) {
+        // Sequence window finished without any balloon -> all Skipped
+        records.forEach(r => { r.balloon_status = 'Skipped'; });
+        return records;
+      }
+      // Active sequence, nothing run yet -> auto first record, all fields "-"
+      const first = balloons[0];
+      return [{
+        balloon_seq: parseInt(first.sequence) || 1,
+        start: '-',
+        end: '-',
+        duration: '-',
+        balloon_status: '-',
+        planned_touch_time: this.parseTouchTime(first.touch_time || '00:00:00'),
+        actual_run: '-',
+        actual_idle: '-',
+        actual_disconnect: '-',
+        actual_alarm: '-',
+        total_seq_time: '-',
+        message: '-',
+        alarm: '-'
+      }];
+    }
+
+    // Helper: fresh record for an appended (re-run / unknown) balloon value
+    const makeRecord = (seqValue) => {
+      const planned = balloons.find(s => (parseInt(s.sequence) || 0) === seqValue);
+      return {
+        balloon_seq: seqValue,
+        start: '-',
+        end: '-',
+        duration: 0,
+        balloon_status: 'Pending',
+        planned_touch_time: planned ? this.parseTouchTime(planned.touch_time || '00:00:00') : 0,
+        actual_run: 0,
+        actual_idle: 0,
+        actual_disconnect: 0,
+        actual_alarm: 0,
+        total_seq_time: 0,
+        message: '-',
+        alarm: '-'
+      };
+    };
+
+    // Helper: mark a record active (Running/Rework-N) until the window end
+    const markActive = (rec, ts, status) => {
+      rec.balloon_status = status;
+      rec.start = ts;
+      rec.end = windowEnd;
+      rec.duration = Math.round((windowEnd - ts) / 1000);
+      rec.actual_run = rec.duration;
+      rec.total_seq_time = rec.duration;
+    };
+
+    const isInList = (value) =>
+      balloons.some(s => (parseInt(s.sequence) || 0) === value);
+
+    let pointer = 0;             // forward position in the balloon list
+    let maxReachedIndex = -1;    // furthest forward balloon reached
+    let running = null;          // currently active record
+    let runningKind = 'normal';  // 'normal' | 'unknown' | 'rework'
+    const appended = [];         // re-run / unknown records
+    const completedSeqs = new Set();
+    const reworkCounts = new Map(); // balloon value -> rework count
+
+    // Close the currently running record at the given timestamp
+    const closeRunning = (endTs) => {
+      if (!running) return;
+      running.end = endTs;
+      running.duration = Math.round((endTs - running.start) / 1000);
+      running.actual_run = running.duration;
+      running.total_seq_time = running.duration;
+      if (runningKind === 'unknown') {
+        running.balloon_status = 'Unknown';
+      } else if (runningKind === 'rework') {
+        // keep the existing "Rework-N" label
+      } else {
+        running.balloon_status = 'Completed';
+        completedSeqs.add(running.balloon_seq);
+      }
+      running = null;
+      runningKind = 'normal';
+    };
+
+    for (const reading of readings) {
+      closeRunning(reading.ts);
+
+      // Forward search from the current pointer
+      let targetIndex = -1;
+      for (let k = pointer; k < records.length; k++) {
+        if (records[k].balloon_seq === reading.value) {
+          targetIndex = k;
+          break;
+        }
+      }
+
+      if (targetIndex >= 0) {
+        // Forward move: jumped-over balloons -> Skipped, matched -> Running
+        for (let k = pointer; k < targetIndex; k++) {
+          records[k].balloon_status = 'Skipped';
+        }
+        markActive(records[targetIndex], reading.ts, 'Running');
+        running = records[targetIndex];
+        runningKind = 'normal';
+        pointer = targetIndex + 1;
+        if (targetIndex > maxReachedIndex) maxReachedIndex = targetIndex;
+      } else if (isInList(reading.value)) {
+        // Known balloon already passed -> going back skips any not-yet-reached
+        // forward balloons, then the re-run is appended as a new record
+        for (let k = pointer; k < records.length; k++) {
+          records[k].balloon_status = 'Skipped';
+        }
+        if (records.length - 1 > maxReachedIndex) maxReachedIndex = records.length - 1;
+        pointer = records.length;
+
+        if (completedSeqs.has(reading.value)) {
+          const count = (reworkCounts.get(reading.value) || 0) + 1;
+          reworkCounts.set(reading.value, count);
+          const rec = makeRecord(reading.value);
+          markActive(rec, reading.ts, `Rework-${count}`);
+          running = rec;
+          runningKind = 'rework';
+          appended.push(rec);
+        } else {
+          const rec = makeRecord(reading.value);
+          markActive(rec, reading.ts, 'Running');
+          running = rec;
+          runningKind = 'normal';
+          appended.push(rec);
+        }
+      } else {
+        // Unknown balloon -> skip remaining forward, append as Running
+        for (let k = pointer; k < records.length; k++) {
+          records[k].balloon_status = 'Skipped';
+        }
+        if (records.length - 1 > maxReachedIndex) maxReachedIndex = records.length - 1;
+        pointer = records.length;
+
+        const rec = makeRecord(reading.value);
+        markActive(rec, reading.ts, 'Running');
+        running = rec;
+        runningKind = 'unknown';
+        appended.push(rec);
+      }
+    }
+
+    // Window closed -> finalize the running record and skip the leftovers
+    if (closeAtEnd) {
+      closeRunning(windowEnd);
+      for (let k = pointer; k < records.length; k++) {
+        records[k].balloon_status = 'Skipped';
+      }
+      if (records.length - 1 > maxReachedIndex) maxReachedIndex = records.length - 1;
+    }
+
+    // Output: forward balloons reached, plus appended re-run / unknown records
+    let output = maxReachedIndex >= 0 ? records.slice(0, maxReachedIndex + 1) : [];
+    output = output.concat(appended);
+
+    if (output.length === 0) {
+      const first = balloons[0];
+      return [{
+        balloon_seq: parseInt(first.sequence) || 1,
+        start: '-',
+        end: '-',
+        duration: '-',
+        balloon_status: '-',
+        planned_touch_time: this.parseTouchTime(first.touch_time || '00:00:00'),
+        actual_run: '-',
+        actual_idle: '-',
+        actual_disconnect: '-',
+        actual_alarm: '-',
+        total_seq_time: '-',
+        message: '-',
+        alarm: '-'
+      }];
+    }
+
+    // Enrich each materialized balloon (numeric start/end) with alarm text and
+    // actual machine-status durations; mark Incomplete (Network Off) on disconnect
+    output.forEach(rec => {
+      if (typeof rec.start === 'number' && typeof rec.end === 'number') {
+        rec.alarm = this.collectValuesInRange(liveAlarm, rec.start, rec.end);
+
+        const d = this.calculateStatusDurations(machineStatus, rec.start, rec.end);
+        rec.actual_run = Math.round(d.run_time / 1000);
+        rec.actual_idle = Math.round(d.idle_time / 1000);
+        rec.actual_disconnect = Math.round(d.disconnect_time / 1000);
+        rec.actual_alarm = Math.round(d.alarm_time / 1000);
+
+        if (rec.actual_disconnect > 0) {
+          rec.balloon_status = 'Incomplete';
           rec.message = 'Network Off';
         }
       }
@@ -672,7 +966,7 @@ class ScheduledReportUpdater {
           const telemetry = await this.reportService.getDeviceTelemetry(
             deviceId,
             ['sequence_report', 'parts_count', 'live_component', 'live_operator', 'machine_status', 'sequence_number',
-             'live_alarm', 'serial_number', 'programme_numberr', 'revision_no'],
+             'balloon_seq', 'live_alarm', 'serial_number', 'programme_numberr', 'revision_no'],
             lookbackTime,
             nowMs
           );
@@ -771,7 +1065,8 @@ class ScheduledReportUpdater {
                   endTime,
                   isPartComplete,
                   telemetry.machine_status,
-                  telemetry.live_alarm
+                  telemetry.live_alarm,
+                  telemetry.balloon_seq
                 );
 
                 // Calculate machine status durations for this part
