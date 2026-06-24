@@ -1,0 +1,12 @@
+# Don't copy these into the image.
+node_modules
+npm-debug.log
+.git
+.gitignore
+
+# Secrets — passed at runtime with --env-file, never baked into the image.
+.env
+
+# Local notes / sample data not needed to run the server.
+*.log
+.claude
