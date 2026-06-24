@@ -565,8 +565,14 @@ class ScheduledReportUpdater {
         rec.actual_disonnect = Math.round(d.disconnect_time / 1000);
         rec.actual_alarm = Math.round(d.alarm_time / 1000);
 
-        // Any disconnect during the sequence marks it Incomplete (Network Off)
-        if (rec.actual_disonnect > 0) {
+        // Disconnect handling depends on whether this sequence has balloons:
+        //   - no balloons: a disconnect in the sequence window marks the
+        //     SEQUENCE Incomplete (Network Off).
+        //   - has balloons: the disconnect Incomplete is carried by the balloon
+        //     whose window it falls in (set in buildBalloonSeqDetail below), so
+        //     the sequence keeps its normal status (e.g. Running/Completed).
+        const seqHasBalloons = Array.isArray(rec._balloonList) && rec._balloonList.length > 0;
+        if (rec.actual_disonnect > 0 && !seqHasBalloons) {
           rec.operation_status = 'Incomplete';
           rec.message = 'Network Off';
         }
@@ -1299,7 +1305,13 @@ class ScheduledReportUpdater {
 
         const cached = this.cachedReports[deviceId];
         cached.reports.forEach(r => {
-          if (r.ts >= fromTimestamp && r.ts <= toTimestamp) {
+          // A part belongs to a day-window if its [start_time, end_time] window
+          // OVERLAPS the query window — not just if it started inside it. This
+          // way a part that spans midnight (e.g. starts Jun 13 11:54pm, ends
+          // Jun 14 1:00am) appears in BOTH the Jun 13 and the Jun 14 report.
+          const partStart = (r.data.start_time != null) ? r.data.start_time : r.ts;
+          const partEnd = (r.data.end_time != null) ? r.data.end_time : partStart;
+          if (partStart <= toTimestamp && partEnd >= fromTimestamp) {
             // Return complete report with sequence_detail as-is
             reportData.push({
               actual_part: r.data.actual_part || 0,

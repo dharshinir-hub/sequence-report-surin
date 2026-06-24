@@ -37,10 +37,9 @@ router.get('/machine-list/:customerName', async (req, res) => {
 // CSV export endpoint (must come BEFORE the generic sequence-report route)
 // :page uses (\d*) so it also matches an EMPTY segment — the frontend sends the
 // page as blank, producing a double slash: /download/{machine}//{from}/{to}
-router.get('/sequence-report/download/:machine/:page(\\d*)/:fromTime/:toTime', async (req, res) => {
+router.get('/sequence-report/download/:machine/:shiftNo/:fromTime/:toTime', async (req, res) => {
   try {
-    const { machine, fromTime, toTime } = req.params;
-    const shiftNo = 'all'; // Default to all shifts for CSV export
+    const { machine, shiftNo, fromTime, toTime } = req.params;
 
     // Convert date format (YYYY-MM-DD) to timestamps if needed
     let fromTs = parseInt(fromTime);
@@ -67,73 +66,104 @@ router.get('/sequence-report/download/:machine/:page(\\d*)/:fromTime/:toTime', a
       10000 // high limit to get all records
     );
 
-    // Build CSV header
+    // CSV columns mirror the on-screen Sequence Report table exactly. The 16
+    // part-level columns (S.no .. Component Status) are written only on a part's
+    // FIRST sequence row and left BLANK on its remaining sequence rows — the same
+    // parent/child layout the table shows, so part values don't repeat down rows.
     const headers = [
-      'Part Number',
-      'Component No',
-      'Component Name',
-      'Operator No',
-      'Operator Name',
-      'Serial Number',
-      'Program Number',
-      'Revision No',
-      'Start Time',
-      'End Time',
-      'Run Time (s)',
-      'Idle Time (s)',
-      'Disconnect Time (s)',
-      'Alarm Time (s)',
-      'Operation Sequence',
-      'Operation Status',
-      'Duration (s)',
-      'Planned Touch Time (ms)',
-      'Actual Run (s)',
-      'Actual Idle (s)',
-      'Message',
-      'Alarm'
+      'S.no', 'Date & Time', 'Machine Name', 'Operator No', 'Operator Name',
+      'Comp. Drawing No', 'Comp. Description', 'Comp. Serial No', 'Program No',
+      'Revision No', 'Actual Part Count', 'Run Time', 'Idle Time', 'Disconnect Time',
+      'Alarm Time', 'Component Status', 'Operation Sequence', 'Planned Touch Time',
+      'Start Time', 'End Time', 'Actual Run Time', 'Operation Status', 'Alarm', 'Message'
     ];
 
-    const rows = [];
-    rows.push(headers.map(h => `"${h}"`).join(','));
+    // seconds -> HH:MM:SS (matches the table's formatTime)
+    const hms = (s) => {
+      const n = Number(s);
+      if (isNaN(n)) return '00:00:00';
+      const h = Math.floor(n / 3600), m = Math.floor((n % 3600) / 60), sec = Math.round(n % 60);
+      return [h, m, sec].map(v => String(v).padStart(2, '0')).join(':');
+    };
+    // epoch ms -> "DD-MM-YYYY HH:mm:ss" (matches the table's Date & Time column)
+    const dateTime = (ms) => {
+      const d = new Date(Number(ms));
+      if (isNaN(d.getTime())) return '';
+      const p = (v) => String(v).padStart(2, '0');
+      return `${p(d.getDate())}-${p(d.getMonth() + 1)}-${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    };
+    // epoch ms -> "HH:MM:SS" time-of-day (matches the table's seq Start/End columns)
+    const timeOfDay = (ms) => {
+      if (typeof ms !== 'number') return '-';
+      const d = new Date(ms);
+      if (isNaN(d.getTime())) return '-';
+      const p = (v) => String(v).padStart(2, '0');
+      return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    };
+    const num = (v) => {
+      if (v === null || v === undefined || v === '' || v === '-') return '-';
+      const n = Number(v);
+      return isNaN(n) ? '-' : Math.round(n);
+    };
+    const fb = (v) => (v === null || v === undefined || v === '') ? '-' : v;
+    const cell = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
 
-    // Build CSV rows: one row per sequence detail (to flatten the nested structure)
+    const rows = [];
+    rows.push(headers.map(cell).join(','));
+
+    let sno = 0;
     report.data.forEach(part => {
+      sno += 1;
+      // 16 part-level columns
       const partBase = [
-        part.part_number,
-        part.component_no,
-        part.component_name,
-        part.operator_no,
-        part.operator_name,
-        part.serial_number,
-        part.program_number,
-        part.revision_no,
-        new Date(part.start_time).toISOString(),
-        new Date(part.end_time).toISOString(),
-        part.run_time,
-        part.idle_time,
-        part.disconnect_time,
-        part.alarm_time
+        sno,
+        dateTime(part.start_time),
+        fb(part.machine_name),
+        fb(part.operator_no),
+        fb(part.operator_name),
+        fb(part.component_no),
+        fb(part.component_name),
+        fb(part.serial_number),
+        fb(part.program_number),
+        fb(part.revision_no),
+        fb(part.part_number),
+        hms(part.run_time),
+        hms(part.idle_time),
+        hms(part.disconnect_time),
+        hms(part.alarm_time),
+        fb(part.component_status)
+      ];
+      const blankBase = partBase.map(() => '');
+
+      // 8 detail columns shared by sequence and balloon rows. The first column
+      // is the Operation Sequence label: "S<n>" for a sequence, "B<n>" for a
+      // balloon (matching the on-screen table).
+      const detailCols = (label, planned, start, end, run, status, alarm, message) => [
+        label, fb(planned), timeOfDay(start), timeOfDay(end), num(run), fb(status), fb(alarm), fb(message)
       ];
 
-      if (!part.sequence_detail || part.sequence_detail.length === 0) {
-        // No sequence details, just add the part info
-        const row = [...partBase, '', '', '', '', '', '', '', ''];
-        rows.push(row.map(cell => `"${cell}"`).join(','));
+      const details = Array.isArray(part.sequence_detail) ? part.sequence_detail : [];
+      if (details.length === 0) {
+        rows.push([...partBase, '', '', '', '', '', '', '', ''].map(cell).join(','));
       } else {
-        // Add one row per sequence detail
-        part.sequence_detail.forEach(seq => {
-          const seqData = [
-            seq.operation_sequence,
-            seq.operation_status,
-            seq.duration,
-            seq.planed_touch_time,
-            seq.actual_run,
-            seq.actual_idle,
-            seq.message,
-            seq.alarm
-          ];
-          const row = [...partBase, ...seqData];
-          rows.push(row.map(cell => `"${cell}"`).join(','));
+        let firstRow = true;
+        details.forEach(seq => {
+          // sequence row "S<n>": part-level cells only on the very first row
+          const base = firstRow ? partBase : blankBase;
+          firstRow = false;
+          rows.push([...base, ...detailCols(
+            'S' + seq.operation_sequence, seq.planed_touch_time, seq.start, seq.end,
+            seq.actual_run, seq.operation_status, seq.alarm, seq.message
+          )].map(cell).join(','));
+
+          // nested balloon rows "B<n>": part-level cells always blank
+          const balloons = Array.isArray(seq.balloon_seq) ? seq.balloon_seq : [];
+          balloons.forEach(b => {
+            rows.push([...blankBase, ...detailCols(
+              'B' + b.balloon_seq, b.planned_touch_time, b.start, b.end,
+              b.actual_run, b.balloon_status, b.alarm, b.message
+            )].map(cell).join(','));
+          });
         });
       }
     });
