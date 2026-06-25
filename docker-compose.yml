@@ -21,8 +21,8 @@ services:
       - CUSTOMER_NAME=Surin
       - UPDATE_INTERVAL_SECONDS=120
       - TELEMETRY_LOOKBACK_HOURS=24
-      - REPORTS_PORT=6016
+      - REPORTS_PORT=6008
       - NODE_ENV=development
 
     ports:
-      - "6016:6016"
+      - "6008:6008"

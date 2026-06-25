@@ -17,7 +17,7 @@ COPY . .
 
 # The app reads REPORTS_PORT from the environment (default 6005, set to 6016 in
 # .env). EXPOSE is documentation only; actual mapping is done with -p at runtime.
-EXPOSE 6016
+EXPOSE 6008
 
 # ---- Start ------------------------------------------------------------------
 CMD ["node", "index.js"]
