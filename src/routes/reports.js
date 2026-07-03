@@ -136,7 +136,7 @@ router.get('/sequence-report/download/:machine/:shiftNo/:fromTime/:toTime', asyn
       const blankBase = partBase.map(() => '');
 
       // 8 detail columns shared by sequence and balloon rows. The first column
-      // is the Operation Sequence label: "S<n>" for a sequence, "B<n>" for a
+      // is the Operation Sequence label: "N<n>" for a sequence, "B<n>" for a
       // balloon (matching the on-screen table).
       const detailCols = (label, planned, start, end, run, status, alarm, message) => [
         label, fb(planned), timeOfDay(start), timeOfDay(end), num(run), fb(status), fb(alarm), fb(message)
@@ -148,11 +148,11 @@ router.get('/sequence-report/download/:machine/:shiftNo/:fromTime/:toTime', asyn
       } else {
         let firstRow = true;
         details.forEach(seq => {
-          // sequence row "S<n>": part-level cells only on the very first row
+          // sequence row "N<n>": part-level cells only on the very first row
           const base = firstRow ? partBase : blankBase;
           firstRow = false;
           rows.push([...base, ...detailCols(
-            'S' + seq.operation_sequence, seq.planed_touch_time, seq.start, seq.end,
+            'N' + seq.operation_sequence, seq.planed_touch_time, seq.start, seq.end,
             seq.actual_run, seq.operation_status, seq.alarm, seq.message
           )].map(cell).join(','));
 

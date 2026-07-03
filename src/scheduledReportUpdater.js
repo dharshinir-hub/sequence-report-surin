@@ -972,10 +972,15 @@ class ScheduledReportUpdater {
           const telemetry = await this.reportService.getDeviceTelemetry(
             deviceId,
             ['sequence_report', 'parts_count', 'live_component', 'live_operator', 'machine_status', 'sequence_number',
-             'balloon_seq', 'live_alarm', 'serial_number', 'programme_numberr', 'revision_no'],
+             'seq_no', 'balloon_seq', 'live_alarm', 'serial_number', 'programme_numberr', 'revision_no'],
             lookbackTime,
             nowMs
           );
+
+          // Support both field names: sequence_number and seq_no
+          if (!telemetry.sequence_number || telemetry.sequence_number.length === 0) {
+            telemetry.sequence_number = telemetry.seq_no || [];
+          }
 
           // Parse and cache reports
           const reports = [];
