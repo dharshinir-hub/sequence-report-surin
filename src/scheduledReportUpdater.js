@@ -56,7 +56,7 @@ class ScheduledReportUpdater {
         if (v.alarm_message) {
           v = v.alarm_message;
         } else {
-          skip = true; // Skip JSON objects without alarm_message
+          skip = true;
         }
       } else if (typeof v === 'string' && v.trim().startsWith('{')) {
         try {
@@ -64,13 +64,13 @@ class ScheduledReportUpdater {
           if (obj.alarm_message) {
             v = obj.alarm_message;
           } else {
-            skip = true; // Skip JSON strings without alarm_message
+            skip = true;
           }
         } catch (e) { /* keep raw string */ }
       }
 
       if (!skip) {
-        v = String(v);
+        v = String(v).replace(/\s+/g, ' ').trim(); // collapse ThingsBoard's padding spaces
         if (v !== '' && !unique.includes(v)) unique.push(v);
       }
     });
@@ -116,17 +116,24 @@ class ScheduledReportUpdater {
     // Sort by start_time ascending (earliest first, current/latest last)
     components.sort((a, b) => a.start_time - b.start_time);
 
-    // Deduplicate the SAME component (same code) that was posted more than once
-    // for this part. Merge their time windows so it appears just once. Different
-    // components (different codes) are kept separate.
+    // Among components that STARTED before the part, keep only the most recent one
+    // (the component that was actually active at part start). Components that
+    // started DURING the part are all kept (they represent a component change
+    // mid-part). This prevents old/expired components from appearing on every part.
+    const beforePart = components.filter(c => c.start_time <= partStartTime);
+    const duringPart = components.filter(c => c.start_time > partStartTime);
+    const atStart = beforePart.length > 0 ? [beforePart[beforePart.length - 1]] : [];
+    const filtered = [...atStart, ...duringPart];
+
+    // Deduplicate the SAME component (same code) that was posted more than once.
+    // Merge their time windows so sequence lookups stay accurate.
     const deduped = [];
     const byCode = new Map();
-    components.forEach(comp => {
+    filtered.forEach(comp => {
       if (byCode.has(comp.code)) {
         const existing = byCode.get(comp.code);
         existing.start_time = Math.min(existing.start_time, comp.start_time);
         existing.end_time = Math.max(existing.end_time, comp.end_time);
-        // keep the richer sequence list if the existing one is empty
         if ((!existing.sequences || existing.sequences.length === 0) && comp.sequences) {
           existing.sequences = comp.sequences;
         }
@@ -220,19 +227,26 @@ class ScheduledReportUpdater {
       return { code: '-', name: 'No operator' };
     }
 
-    // Sort by start_time ascending so the current (latest) operator is last (2nd place)
+    // Sort by start_time ascending
     operators.sort((a, b) => a.start_time - b.start_time);
 
-    // Deduplicate the SAME operator (same code) posted more than once for this
-    // part, so it isn't shown as "2||2". Different operators are kept separate.
+    // Among operators who STARTED before the part, keep only the most recent one
+    // (the one actually active at part start). Operators who started during the
+    // part are all kept (they represent a handover within the part).
+    const beforePart = operators.filter(o => o.start_time <= partStartTime);
+    const duringPart = operators.filter(o => o.start_time > partStartTime);
+    const atStart = beforePart.length > 0 ? [beforePart[beforePart.length - 1]] : [];
+    const filtered = [...atStart, ...duringPart];
+
+    // Deduplicate the SAME operator (same code) posted more than once.
     const seen = new Set();
-    const uniqueOperators = operators.filter(o => {
+    const uniqueOperators = filtered.filter(o => {
       if (seen.has(o.code)) return false;
       seen.add(o.code);
       return true;
     });
 
-    // Merge multiple operators with || (current/latest one appears last)
+    // Merge multiple operators with || (earliest first, latest last)
     return {
       code: uniqueOperators.map(o => o.code).join('||'),
       name: uniqueOperators.map(o => o.name).join('||')
@@ -261,7 +275,7 @@ class ScheduledReportUpdater {
           const value = parseInt(Array.isArray(entry) ? entry[1] : entry.value);
           return { ts, value };
         })
-        .filter(r => !isNaN(r.value))
+        .filter(r => !isNaN(r.value) && r.value !== 0)
         .sort((a, b) => a.ts - b.ts);
     }
 
@@ -284,9 +298,14 @@ class ScheduledReportUpdater {
     for (let c = 0; c < componentsInPart.length; c++) {
       const comp = componentsInPart[c];
 
-      // Effective window of this component within the part
+      // Effective window of this component within the part.
+      // Clip end to the NEXT component's start so windows are non-overlapping —
+      // otherwise the same sequence reading falls in both windows and appears twice.
       const windowStart = Math.max(partStartTime, comp.start_time);
-      const windowEnd = Math.min(partEndTime, comp.end_time);
+      const nextComp = c < componentsInPart.length - 1 ? componentsInPart[c + 1] : null;
+      const windowEnd = nextComp !== null
+        ? Math.min(partEndTime, comp.end_time, nextComp.start_time)
+        : Math.min(partEndTime, comp.end_time);
       if (windowEnd <= windowStart) continue; // no real overlap
 
       const isLastComp = (c === componentsInPart.length - 1);
@@ -972,7 +991,7 @@ class ScheduledReportUpdater {
           const telemetry = await this.reportService.getDeviceTelemetry(
             deviceId,
             ['sequence_report', 'parts_count', 'live_component', 'live_operator', 'machine_status', 'sequence_number',
-             'seq_no', 'balloon_seq', 'live_alarm', 'serial_number', 'programme_numberr', 'revision_no'],
+             'seq_no', 'balloon_seq', 'live_alarm', 'serial_number', 'job_name', 'revision_no'],
             lookbackTime,
             nowMs
           );
@@ -995,8 +1014,37 @@ class ScheduledReportUpdater {
               return tsA - tsB;
             });
 
-            console.log(`  [DEBUG] parts_count for ${deviceName}: ${sortedParts.length} entries`);
-            console.log(`  [DEBUG] sortedParts:`, sortedParts);
+            // Build cleanParts: normalised {ts, value, forcedEnd?} objects.
+            //   - Skip NaN entries.
+            //   - Skip consecutive duplicate non-zero values (ThingsBoard periodic echoes).
+            //   - Zero entries are NOT part records, but their timestamp caps the
+            //     end-time of the preceding non-zero part (machine reset / shift end).
+            const cleanParts = [];
+            let pendingZeroTs = null; // timestamp of the most recent zero seen
+            for (const entry of sortedParts) {
+              const v   = parseInt(Array.isArray(entry) ? entry[1] : entry.value);
+              const ts  = Array.isArray(entry) ? entry[0] : entry.ts;
+              if (isNaN(v)) continue;
+              if (v === 0) { pendingZeroTs = ts; continue; }          // zero → remember timestamp, skip record
+              if (this.isShiftStartTime(ts, shifts)) continue;        // shift-boundary echo → skip
+              const prevV = cleanParts.length > 0 ? cleanParts[cleanParts.length - 1].value : -1;
+              if (v === prevV) continue;                               // consecutive duplicate → skip
+              if (pendingZeroTs !== null && cleanParts.length > 0) {  // zero arrived before this new value
+                cleanParts[cleanParts.length - 1].forcedEnd = pendingZeroTs;
+              }
+              // Start time = zero's timestamp when a reset preceded this part,
+              // otherwise use the entry's own timestamp.
+              const partStartTs = (pendingZeroTs !== null) ? pendingZeroTs : ts;
+              pendingZeroTs = null;
+              cleanParts.push({ ts: partStartTs, value: v });
+            }
+            // Handle a trailing zero (shift-end reset after the last non-zero entry)
+            if (pendingZeroTs !== null && cleanParts.length > 0) {
+              cleanParts[cleanParts.length - 1].forcedEnd = pendingZeroTs;
+            }
+
+            console.log(`  [DEBUG] parts_count for ${deviceName}: ${sortedParts.length} raw, ${cleanParts.length} after cleaning`);
+            console.log(`  [DEBUG] cleanParts:`, cleanParts);
             console.log(`  [DEBUG] Shift schedule:`, shifts.map(s => `${s.start}-${s.end}`).join(', '));
 
             let previousPartIndex = -1;
@@ -1005,42 +1053,20 @@ class ScheduledReportUpdater {
             // flag duplicate parts (same 3 identity values under one component)
             const componentSignatures = new Map();
 
-            for (let i = 0; i < sortedParts.length; i++) {
+            for (let i = 0; i < cleanParts.length; i++) {
               try {
-                const entry = sortedParts[i];
-                // Handle both array [ts, value] and object {ts, value} formats
-                const startTime = Array.isArray(entry) ? entry[0] : entry.ts;
-                const partValue = Array.isArray(entry) ? entry[1] : entry.value;
-                const partNumber = !isNaN(parseInt(partValue)) ? parseInt(partValue) : (i + 1);
+                const entry = cleanParts[i];
+                const startTime  = entry.ts;
+                const partNumber = entry.value;
 
-                // Check if this part number matches the previous part number
-                let isSamePartNumber = false;
-                if (previousPartIndex >= 0) {
-                  const previousPartNumber = reports[previousPartIndex].data.part_number;
-                  isSamePartNumber = (previousPartNumber === partNumber);
-                }
-
-                // Only check shift logic if SAME part number (continuation of same part across shift)
-                if (isSamePartNumber) {
-                  const isShiftStart = this.isShiftStartTime(startTime, shifts);
-
-                  if (isShiftStart) {
-                    // Update the previous part's end_time to this part's start_time
-                    const previousReport = reports[previousPartIndex];
-                    previousReport.data.end_time = startTime;
-                    console.log(`  [DEBUG] Part ${partNumber} @ shift start 10:00 - extending previous part ${previousReport.data.part_number} end_time to ${startTime}`);
-                    continue; // Skip creating a new record for this part
-                  }
-                }
-
-                // A part is complete when a later part exists; the last part is
-                // still active (ongoing), so end_time = current time for it.
-                const isPartComplete = i < sortedParts.length - 1;
-
-                // end_time = next part's start_time, or current time for last part
-                const endTime = isPartComplete
-                  ? (Array.isArray(sortedParts[i + 1]) ? sortedParts[i + 1][0] : sortedParts[i + 1].ts)
-                  : nowMs;
+                // end_time priority:
+                //   1. forcedEnd  — a zero reset appeared before the next different value
+                //   2. next entry's ts — normal part boundary
+                //   3. nowMs — last (still-active) part
+                const isPartComplete = i < cleanParts.length - 1;
+                const endTime = entry.forcedEnd !== undefined
+                  ? entry.forcedEnd
+                  : (isPartComplete ? cleanParts[i + 1].ts : nowMs);
 
                 console.log(`  [DEBUG] Building report for part ${partNumber}, startTime=${startTime}, endTime=${endTime}`);
 
@@ -1090,7 +1116,11 @@ class ScheduledReportUpdater {
                 // Collect serial_number / program_number / revision_no values
                 // posted within this part's window (joined with || if multiple)
                 const serialNumber = this.collectValuesInRange(telemetry.serial_number, startTime, endTime);
-                const programNumber = this.collectValuesInRange(telemetry.programme_numberr, startTime, endTime);
+                // job_name comes as "//CNC_MEM/USB_PRG/YANTRA/O0034" — extract the last segment only
+                const rawJobName = this.collectValuesInRange(telemetry.job_name, startTime, endTime);
+                const programNumber = rawJobName === '-'
+                  ? '-'
+                  : rawJobName.split('||').map(v => v.split('/').filter(Boolean).pop() || v).join('||');
                 const revisionNo = this.collectValuesInRange(telemetry.revision_no, startTime, endTime);
 
                 // component_status: "duplicate" when the same serial/program/

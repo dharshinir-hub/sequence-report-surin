@@ -46,10 +46,10 @@ router.get('/sequence-report/download/:machine/:shiftNo/:fromTime/:toTime', asyn
     let toTs = parseInt(toTime);
 
     if (isNaN(fromTs) || fromTime.includes('-')) {
-      fromTs = new Date(fromTime + 'T00:00:00Z').getTime();
+      fromTs = new Date(fromTime + 'T00:00:00+05:30').getTime();
     }
     if (isNaN(toTs) || toTime.includes('-')) {
-      toTs = new Date(toTime + 'T23:59:59Z').getTime();
+      toTs = new Date(toTime + 'T23:59:59+05:30').getTime();
     }
 
     if (!req.reportUpdater) {
@@ -191,10 +191,10 @@ router.get('/sequence-report/:machine/:shiftNo/:fromTime/:toTime/:page/:limit', 
 
     // If not a valid timestamp, try parsing as date string (YYYY-MM-DD)
     if (isNaN(fromTs) || fromTime.includes('-')) {
-      fromTs = new Date(fromTime + 'T00:00:00Z').getTime();
+      fromTs = new Date(fromTime + 'T00:00:00+05:30').getTime();
     }
     if (isNaN(toTs) || toTime.includes('-')) {
-      toTs = new Date(toTime + 'T23:59:59Z').getTime();
+      toTs = new Date(toTime + 'T23:59:59+05:30').getTime();
     }
 
     console.log(`[API] /sequence-report query:`, { machine: decodeURIComponent(machine), fromTime, toTime, fromTs, toTs, page, limit });
@@ -234,8 +234,8 @@ router.get('/reports', async (req, res) => {
     }
 
     // Convert date format (YYYY-MM-DD) to timestamps
-    const fromTs = new Date(startDate + 'T00:00:00Z').getTime();
-    const toTs = new Date(endDate + 'T23:59:59Z').getTime();
+    const fromTs = new Date(startDate + 'T00:00:00+05:30').getTime();
+    const toTs = new Date(endDate + 'T23:59:59+05:30').getTime();
 
     console.log(`[API] /reports query:`, { machine, startDate, endDate, fromTs, toTs, page, limit });
 
