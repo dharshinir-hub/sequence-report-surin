@@ -78,6 +78,30 @@ class ScheduledReportUpdater {
     return unique.length > 0 ? unique.join('||') : '-';
   }
 
+  // Carry-forward: most recent telemetry value strictly before `ts`. Used when a
+  // part has no reading inside its own window (the old software keeps showing the
+  // last-known value until a new one arrives, so we do the same). Applies the
+  // same cleaning as collectValuesInRange. Returns '-' when nothing precedes it.
+  lastValueBefore(telemetryData, ts) {
+    if (!telemetryData || telemetryData.length === 0) return '-';
+    let best = null;
+    telemetryData.forEach(entry => {
+      const ets = Array.isArray(entry) ? entry[0] : entry.ts;
+      if (ets < ts && (best === null || ets > best.ts)) {
+        best = { ts: ets, value: Array.isArray(entry) ? entry[1] : entry.value };
+      }
+    });
+    if (best === null) return '-';
+    let v = best.value;
+    if (typeof v === 'object' && v !== null) {
+      if (v.alarm_message) v = v.alarm_message; else return '-';
+    } else if (typeof v === 'string' && v.trim().startsWith('{')) {
+      try { const obj = JSON.parse(v); if (obj.alarm_message) v = obj.alarm_message; else return '-'; } catch (e) { /* keep raw */ }
+    }
+    v = String(v).replace(/\s+/g, ' ').trim();
+    return v === '' ? '-' : v;
+  }
+
   // Get ALL components that overlap the part's time range, sorted by start_time
   // ascending (so the current/latest component is last). A single part can span
   // multiple components; each carries its own sequence list and time window.
@@ -182,14 +206,20 @@ class ScheduledReportUpdater {
     return shifts;
   }
 
-  // Check if timestamp matches any shift start time
+  // Check if a timestamp lands exactly on a shift boundary (the echo ThingsBoard
+  // posts at HH:00 when a shift starts). Two things must be right:
+  //   1. Shift start hours are IST wall-clock (e.g. 08:00, 20:00), but the
+  //      container runs in UTC — so compute the hour in IST, not server-local.
+  //   2. Only the boundary MINUTE (HH:00) is an echo; matching the whole hour
+  //      wrongly drops real parts anywhere in that hour.
   isShiftStartTime(timestamp, shifts) {
     if (!shifts || shifts.length === 0) return false;
 
-    const date = new Date(timestamp);
-    const hour = date.getHours();
+    const ist = new Date(Number(timestamp) + 5.5 * 3600000); // shift to IST
+    const hour = ist.getUTCHours();
+    const minute = ist.getUTCMinutes();
 
-    return shifts.some(shift => shift.start === hour);
+    return minute === 0 && shifts.some(shift => shift.start === hour);
   }
 
   // Get operator info that matches the part's time range
@@ -1014,11 +1044,15 @@ class ScheduledReportUpdater {
               return tsA - tsB;
             });
 
-            // Build cleanParts: normalised {ts, value, forcedEnd?} objects.
-            //   - Skip NaN entries.
-            //   - Skip consecutive duplicate non-zero values (ThingsBoard periodic echoes).
-            //   - Zero entries are NOT part records, but their timestamp caps the
-            //     end-time of the preceding non-zero part (machine reset / shift end).
+            // Build cleanParts: one entry per distinct-value run, carrying the
+            // run's firstTs and lastTs. parts_count is a completion counter, so a
+            // part's window runs from the PREVIOUS count's last reading to THIS
+            // count's last reading:
+            //   - Skip NaN entries and shift-boundary echoes.
+            //   - Consecutive duplicate values EXTEND the current run's lastTs
+            //     (keep-last) — the last echo of a value is that part's end.
+            //   - Zero entries are resets: their ts caps the previous part
+            //     (forcedEnd) and starts the next part (startOverride).
             const cleanParts = [];
             let pendingZeroTs = null; // timestamp of the most recent zero seen
             for (const entry of sortedParts) {
@@ -1027,16 +1061,18 @@ class ScheduledReportUpdater {
               if (isNaN(v)) continue;
               if (v === 0) { pendingZeroTs = ts; continue; }          // zero → remember timestamp, skip record
               if (this.isShiftStartTime(ts, shifts)) continue;        // shift-boundary echo → skip
-              const prevV = cleanParts.length > 0 ? cleanParts[cleanParts.length - 1].value : -1;
-              if (v === prevV) continue;                               // consecutive duplicate → skip
-              if (pendingZeroTs !== null && cleanParts.length > 0) {  // zero arrived before this new value
-                cleanParts[cleanParts.length - 1].forcedEnd = pendingZeroTs;
+              const last = cleanParts.length > 0 ? cleanParts[cleanParts.length - 1] : null;
+              if (last && v === last.value) { last.lastTs = ts; continue; } // duplicate → extend this run's last ts
+              if (pendingZeroTs !== null && last) {                    // zero arrived before this new value
+                last.forcedEnd = pendingZeroTs;
               }
-              // Start time = zero's timestamp when a reset preceded this part,
-              // otherwise use the entry's own timestamp.
-              const partStartTs = (pendingZeroTs !== null) ? pendingZeroTs : ts;
+              cleanParts.push({
+                value: v,
+                firstTs: ts,
+                lastTs: ts,
+                startOverride: pendingZeroTs !== null ? pendingZeroTs : undefined
+              });
               pendingZeroTs = null;
-              cleanParts.push({ ts: partStartTs, value: v });
             }
             // Handle a trailing zero (shift-end reset after the last non-zero entry)
             if (pendingZeroTs !== null && cleanParts.length > 0) {
@@ -1056,17 +1092,24 @@ class ScheduledReportUpdater {
             for (let i = 0; i < cleanParts.length; i++) {
               try {
                 const entry = cleanParts[i];
-                const startTime  = entry.ts;
+                const prev  = i > 0 ? cleanParts[i - 1] : null;
                 const partNumber = entry.value;
 
+                // start_time: the reset ts if a zero preceded this part, else the
+                //   PREVIOUS run's last reading (when the prior count was last
+                //   seen), else this run's own first ts for the very first part.
+                const startTime = entry.startOverride !== undefined
+                  ? entry.startOverride
+                  : (prev ? prev.lastTs : entry.firstTs);
+
                 // end_time priority:
-                //   1. forcedEnd  — a zero reset appeared before the next different value
-                //   2. next entry's ts — normal part boundary
+                //   1. forcedEnd  — a zero reset appeared before the next value
+                //   2. this run's last ts — the last echo of this count value
                 //   3. nowMs — last (still-active) part
                 const isPartComplete = i < cleanParts.length - 1;
                 const endTime = entry.forcedEnd !== undefined
                   ? entry.forcedEnd
-                  : (isPartComplete ? cleanParts[i + 1].ts : nowMs);
+                  : (isPartComplete ? entry.lastTs : nowMs);
 
                 console.log(`  [DEBUG] Building report for part ${partNumber}, startTime=${startTime}, endTime=${endTime}`);
 
@@ -1080,7 +1123,7 @@ class ScheduledReportUpdater {
 
                 // component_no / component_name join all overlapping components
                 // (earliest first, current/latest last)
-                const componentInfo = componentsInPart.length > 0
+                let componentInfo = componentsInPart.length > 0
                   ? {
                       code: componentsInPart.map(c => c.code).join('||'),
                       name: componentsInPart.map(c => c.name).join('||')
@@ -1116,8 +1159,13 @@ class ScheduledReportUpdater {
                 // Collect serial_number / program_number / revision_no values
                 // posted within this part's window (joined with || if multiple)
                 const serialNumber = this.collectValuesInRange(telemetry.serial_number, startTime, endTime);
-                // job_name comes as "//CNC_MEM/USB_PRG/YANTRA/O0034" — extract the last segment only
-                const rawJobName = this.collectValuesInRange(telemetry.job_name, startTime, endTime);
+                // job_name comes as "//CNC_MEM/USB_PRG/YANTRA/O0034" — extract the last segment only.
+                // Carry-forward the last-known job_name when none was posted in this
+                // part's window (matches old software's persistent program number).
+                let rawJobName = this.collectValuesInRange(telemetry.job_name, startTime, endTime);
+                if (rawJobName === '-') {
+                  rawJobName = this.lastValueBefore(telemetry.job_name, startTime);
+                }
                 const programNumber = rawJobName === '-'
                   ? '-'
                   : rawJobName.split('||').map(v => v.split('/').filter(Boolean).pop() || v).join('||');

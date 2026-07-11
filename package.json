@@ -5,7 +5,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "test": "node test/sequenceReport.test.js",
+    "test:integration": "node test/integration.test.js"
   },
   "dependencies": {
     "mqtt": "^5.4.1",
