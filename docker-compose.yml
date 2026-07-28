@@ -1,3 +1,33 @@
+# version: '3.8'
+
+# services:
+#   sequence-report:
+#     build:
+#       context: .
+#       dockerfile: Dockerfile
+#     container_name: sequence-report
+#     image: dharshiniradhakrishnan/sequence-report:v0.1
+#     restart: unless-stopped
+
+#     environment:
+#       - THINGSBOARD_HOST=yantra24x7.cloud
+#       - THINGSBOARD_PORT=1884
+#       - THINGSBOARD_USER=pms@gmail.com
+#       - THINGSBOARD_PASSWORD=pmspms
+#       - THINGSBOARD_REST_URL=http://yantra24x7.cloud:8080
+#       - MQTT_BROKER=mqtt://yantra24x7.cloud:1884
+#       - MQTT_TOPIC=sequence_report
+#       - CUSTOMER_ID=ca71d920-4d2a-11f1-9352-592ed2a7210c
+#       - CUSTOMER_NAME=Surin
+#       - UPDATE_INTERVAL_SECONDS=120
+#       - TELEMETRY_LOOKBACK_HOURS=336
+#       - REPORTS_PORT=6027
+#       - NODE_ENV=development
+
+#     ports:
+#       - "6027:6027"
+
+
 version: '3.8'
 
 services:
@@ -10,15 +40,15 @@ services:
     restart: unless-stopped
 
     environment:
-      - THINGSBOARD_HOST=yantra24x7.cloud
+      - THINGSBOARD_HOST=smart1.yantra24x7.com
       - THINGSBOARD_PORT=1884
       - THINGSBOARD_USER=pms@gmail.com
       - THINGSBOARD_PASSWORD=pmspms
-      - THINGSBOARD_REST_URL=http://yantra24x7.cloud:8080
-      - MQTT_BROKER=mqtt://yantra24x7.cloud:1884
+      - THINGSBOARD_REST_URL=http://smart1.yantra24x7.com:8080
+      - MQTT_BROKER=mqtt://smart1.yantra24x7.com:1884
       - MQTT_TOPIC=sequence_report
-      - CUSTOMER_ID=ca71d920-4d2a-11f1-9352-592ed2a7210c
-      - CUSTOMER_NAME=Surin
+      - CUSTOMER_ID=f853c6f0-3d3f-11f1-b077-e5ef75b0e368
+      - CUSTOMER_NAME=SURIN_PUNE
       - UPDATE_INTERVAL_SECONDS=120
       - TELEMETRY_LOOKBACK_HOURS=336
       - REPORTS_PORT=6027
@@ -26,3 +56,7 @@ services:
 
     ports:
       - "6027:6027"
+
+    dns:
+      - 1.1.1.1
+      - 8.8.4.4

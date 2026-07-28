@@ -34,8 +34,9 @@ class ScheduledReportUpdater {
   }
 
   // Collect distinct telemetry values whose timestamp falls within [start, end],
-  // in time order, joined with "||". Returns "-" when nothing falls in range.
-  collectValuesInRange(telemetryData, startTime, endTime) {
+  // in time order, joined with "||". For alarms, shows ALL occurrences (no dedup).
+  // Returns "-" when nothing falls in range.
+  collectValuesInRange(telemetryData, startTime, endTime, isAlarmData = false) {
     if (!telemetryData || telemetryData.length === 0) return '-';
 
     const inRange = telemetryData
@@ -46,7 +47,8 @@ class ScheduledReportUpdater {
       .filter(e => e.ts >= startTime && e.ts <= endTime)
       .sort((a, b) => a.ts - b.ts);
 
-    const unique = [];
+    const values = [];
+
     inRange.forEach(e => {
       let v = e.value;
       let skip = false;
@@ -71,11 +73,19 @@ class ScheduledReportUpdater {
 
       if (!skip) {
         v = String(v).replace(/\s+/g, ' ').trim(); // collapse ThingsBoard's padding spaces
-        if (v !== '' && !unique.includes(v)) unique.push(v);
+        if (v !== '') {
+          if (isAlarmData) {
+            // For alarms: include ALL occurrences (even duplicates)
+            values.push(v);
+          } else {
+            // For other values: deduplicate
+            if (!values.includes(v)) values.push(v);
+          }
+        }
       }
     });
 
-    return unique.length > 0 ? unique.join('||') : '-';
+    return values.length > 0 ? values.join('||') : '-';
   }
 
   // Carry-forward: most recent telemetry value strictly before `ts`. Used when a
@@ -340,10 +350,11 @@ class ScheduledReportUpdater {
 
       const isLastComp = (c === componentsInPart.length - 1);
 
-      // Close this component if: another component follows it, OR it ends within
-      // the part, OR the part itself is complete. Only a still-running last
-      // component of the active part is left open (Running).
-      const closeAtEnd = !isLastComp || comp.end_time <= partEndTime || isPartComplete;
+      // Close only a component superseded by another component or a completed
+      // part. The last component of an active part remains open even when its
+      // configured component window has elapsed: without a part-count/reset we
+      // cannot infer that its unreported sequences were skipped.
+      const closeAtEnd = !isLastComp || isPartComplete;
 
       const compDetail = this.buildComponentSequenceDetail(
         comp.sequences,
@@ -408,25 +419,16 @@ class ScheduledReportUpdater {
 
     // No readings in this window
     if (readings.length === 0) {
-      if (closeAtEnd) {
-        // Component window finished without any sequence -> all Skipped.
-        // Each sequence's balloons are Skipped too (first-from-list shown).
-        records.forEach(r => {
-          r.operation_status = 'Skipped';
-          r.balloon_seq = this.buildBalloonSeqDetail(r._balloonList || [], [], windowStart, windowEnd, true, machineStatus, liveAlarm);
-          delete r._balloonList;
-        });
-        return records;
-      }
-      // Active component, nothing run yet -> auto first record, all fields "-".
-      // Post the first balloon from the list too, with "-" fields (same concept).
+      // Always show only the first sequence when no data has arrived yet.
+      // The part may still be running and hasn't reached other sequences.
+      // Mark all others as Skipped only if this component is truly complete (past part end).
       const first = sequences[0];
-      return [{
+      const firstRecord = {
         operation_sequence: parseInt(first.sequence) || 1,
         start: '-',
         end: '-',
         duration: '-',
-        operation_status: '-',
+        operation_status: closeAtEnd ? 'Skipped' : '-',
         planed_touch_time: this.parseTouchTime(first.touch_time || '00:00:00'),
         actual_run: '-',
         actual_idle: '-',
@@ -435,8 +437,22 @@ class ScheduledReportUpdater {
         total_seq_time: '-',
         message: '-',
         alarm: '-',
-        balloon_seq: this.buildBalloonSeqDetail(first.balloon_seq || [], [], windowStart, windowEnd, false, machineStatus, liveAlarm)
-      }];
+        balloon_seq: this.buildBalloonSeqDetail(first.balloon_seq || [], [], windowStart, windowEnd, closeAtEnd, machineStatus, liveAlarm)
+      };
+
+      // Only add remaining sequences as Skipped if part is actually complete
+      if (closeAtEnd) {
+        const result = [firstRecord];
+        for (let i = 1; i < records.length; i++) {
+          records[i].operation_status = 'Skipped';
+          records[i].balloon_seq = this.buildBalloonSeqDetail(records[i]._balloonList || [], [], windowStart, windowEnd, true, machineStatus, liveAlarm);
+          delete records[i]._balloonList;
+          result.push(records[i]);
+        }
+        return result;
+      }
+
+      return [firstRecord];
     }
 
     // Helper: fresh record for an appended (re-run / unknown) sequence value
@@ -606,7 +622,7 @@ class ScheduledReportUpdater {
     //   - Incomplete status + "Network Off" message when it was disconnected
     output.forEach(rec => {
       if (typeof rec.start === 'number' && typeof rec.end === 'number') {
-        rec.alarm = this.collectValuesInRange(liveAlarm, rec.start, rec.end);
+        rec.alarm = this.collectValuesInRange(liveAlarm, rec.start, rec.end, true); // true = isAlarmData to show occurrence count
 
         const d = this.calculateStatusDurations(machineStatus, rec.start, rec.end);
         rec.actual_run = Math.round(d.run_time / 1000);
@@ -873,7 +889,7 @@ class ScheduledReportUpdater {
     // actual machine-status durations; mark Incomplete (Network Off) on disconnect
     output.forEach(rec => {
       if (typeof rec.start === 'number' && typeof rec.end === 'number') {
-        rec.alarm = this.collectValuesInRange(liveAlarm, rec.start, rec.end);
+        rec.alarm = this.collectValuesInRange(liveAlarm, rec.start, rec.end, true); // true = isAlarmData to show occurrence count
 
         const d = this.calculateStatusDurations(machineStatus, rec.start, rec.end);
         rec.actual_run = Math.round(d.run_time / 1000);
@@ -1361,8 +1377,19 @@ class ScheduledReportUpdater {
   // Get part report from cache - returns complete sequence report format
   getPartReportByMachine(machine, shiftNo, fromTime, toTime, page = 0, limit = 10) {
     try {
-      const fromTimestamp = parseInt(fromTime);
-      const toTimestamp = parseInt(toTime);
+      // Handle both timestamp numbers and date strings (YYYY-MM-DD)
+      let fromTimestamp = parseInt(fromTime);
+      let toTimestamp = parseInt(toTime);
+
+      // If parsing resulted in just year (e.g., "2026-07-13" -> 2026), convert date string to timestamp
+      if (fromTimestamp < 1000000000000 || String(fromTime).includes('-')) {
+        const fromDate = new Date(fromTime + (String(fromTime).includes('T') ? '' : 'T00:00:00+05:30'));
+        fromTimestamp = fromDate.getTime();
+      }
+      if (toTimestamp < 1000000000000 || String(toTime).includes('-')) {
+        const toDate = new Date(toTime + (String(toTime).includes('T') ? '' : 'T23:59:59+05:30'));
+        toTimestamp = toDate.getTime();
+      }
 
       // "All Machines" sends multiple device names comma-separated -> support a list
       const machineNames = String(machine)

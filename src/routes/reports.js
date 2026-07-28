@@ -234,8 +234,12 @@ router.get('/reports', async (req, res) => {
     }
 
     // Convert date format (YYYY-MM-DD) to timestamps
+    // Include entire days: from start of startDate to start of day AFTER endDate
+    // This captures parts that cross midnight (e.g., July 12 11pm → July 13 1am shows in July 13 query)
     const fromTs = new Date(startDate + 'T00:00:00+05:30').getTime();
-    const toTs = new Date(endDate + 'T23:59:59+05:30').getTime();
+    const endDateObj = new Date(endDate + 'T00:00:00+05:30');
+    endDateObj.setDate(endDateObj.getDate() + 1); // Move to start of next day
+    const toTs = endDateObj.getTime();
 
     console.log(`[API] /reports query:`, { machine, startDate, endDate, fromTs, toTs, page, limit });
 
